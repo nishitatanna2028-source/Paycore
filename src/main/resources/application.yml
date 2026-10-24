@@ -5,9 +5,21 @@ spring:
     password: ${DB_PASSWORD:paycore}
     hikari:
       maximum-pool-size: 30
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: 6379
+      timeout: 500ms
+      connect-timeout: 500ms
   jpa:
     open-in-view: false
     hibernate:
       ddl-auto: none
   flyway:
     enabled: true
+
+paycore:
+  admin-key: ${ADMIN_KEY:dev-admin-key}
+  rate-limit:
+    capacity: ${RATE_LIMIT_CAPACITY:100}          # max burst
+    refill-per-second: ${RATE_LIMIT_REFILL:50}    # sustained requests/sec per API key

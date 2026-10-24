@@ -11,13 +11,25 @@ services:
       interval: 3s
       timeout: 3s
       retries: 20
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
   app:
     build: .
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       DB_URL: jdbc:postgresql://db:5432/paycore
       DB_USER: paycore
       DB_PASSWORD: paycore
+      REDIS_HOST: redis
+      ADMIN_KEY: dev-admin-key
     ports: ["8080:8080"]
