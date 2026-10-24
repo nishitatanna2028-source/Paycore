@@ -1,0 +1,13 @@
+spring:
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/paycore}
+    username: ${DB_USER:paycore}
+    password: ${DB_PASSWORD:paycore}
+    hikari:
+      maximum-pool-size: 30
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: none
+  flyway:
+    enabled: true
