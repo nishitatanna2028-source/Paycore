@@ -140,6 +140,17 @@ public class ApiController {
         return reconciliation.run();
     }
 
+    /** Payments the fraud rules held for manual review (oldest first). */
+    @GetMapping("/admin/review-queue")
+    public List<Payment> reviewQueue() {
+        return paymentService.reviewQueue();
+    }
+
+    @PostMapping("/admin/payments/{id}/approve")
+    public Payment approve(@PathVariable UUID id) {
+        return paymentService.approveReview(id);
+    }
+
     // ---------- helpers ----------
 
     /** The filter has already verified the key; this just reads who it belonged to. */

@@ -5,11 +5,13 @@ import com.paycore.common.SystemAccounts;
 import com.paycore.domain.*;
 import com.paycore.repo.AccountRepository;
 import com.paycore.repo.PaymentRepository;
+import com.paycore.fraud.FraudService;
 import com.paycore.webhook.WebhookService;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import java.util.List;
 import java.util.UUID;
 
 /**
@@ -27,15 +29,17 @@ public class PaymentService {
     private final AccountRepository accounts;
     private final LedgerService ledger;
     private final WebhookService webhooks;
+    private final FraudService fraud;
     private final int escrowShards;
 
     public PaymentService(PaymentRepository payments, AccountRepository accounts,
-                          LedgerService ledger, WebhookService webhooks,
+                          LedgerService ledger, WebhookService webhooks, FraudService fraud,
                           @Value("${paycore.escrow-shards:1}") int escrowShards) {
         this.payments = payments;
         this.accounts = accounts;
         this.ledger = ledger;
         this.webhooks = webhooks;
+        this.fraud = fraud;
         this.escrowShards = Math.min(Math.max(escrowShards, 1), SystemAccounts.MAX_ESCROW_SHARDS);
     }
 
@@ -49,7 +53,10 @@ public class PaymentService {
             throw new ApiException(HttpStatus.BAD_REQUEST, "customerId must be a CUSTOMER account");
         if (merchant.getType() != AccountType.MERCHANT)
             throw new ApiException(HttpStatus.BAD_REQUEST, "merchantId must be a MERCHANT account");
-        Payment saved = payments.save(new Payment(customerId, merchantId, amount));
+        FraudService.Assessment risk = fraud.assess(customerId, amount);   // may decline (422)
+        Payment payment = new Payment(customerId, merchantId, amount);
+        if (risk.flag() == RiskFlag.REVIEW) payment.markForReview(risk.reason());
+        Payment saved = payments.save(payment);
         webhooks.enqueue(merchantId, "payment.created", saved);
         return saved;
     }
@@ -66,6 +73,9 @@ public class PaymentService {
     public Payment authorize(UUID id, UUID merchantId) {
         Payment p = lock(id);
         assertOwner(p, merchantId);
+        if (p.getRiskFlag() == RiskFlag.REVIEW) {
+            throw new ApiException(HttpStatus.CONFLICT, "Payment is held for manual review: " + p.getRiskReason());
+        }
         p.moveTo(PaymentStatus.AUTHORIZED);
         UUID escrow = SystemAccounts.escrowFor(p.getId(), escrowShards);
         p.assignEscrow(escrow);
@@ -102,6 +112,23 @@ public class PaymentService {
         ledger.transfer(p.getMerchantId(), p.getCustomerId(), p.getAmount(), "REFUND", p.getId());
         webhooks.enqueue(p.getMerchantId(), "payment.refunded", p);
         return p;
+    }
+
+    /** Admin releases a payment that fraud screening held for review. */
+    @Transactional
+    public Payment approveReview(UUID id) {
+        Payment p = lock(id);
+        if (p.getRiskFlag() != RiskFlag.REVIEW) {
+            throw new ApiException(HttpStatus.CONFLICT, "Payment is not awaiting review");
+        }
+        p.approveReview();
+        webhooks.enqueue(p.getMerchantId(), "payment.review_approved", p);
+        return p;
+    }
+
+    @Transactional(readOnly = true)
+    public List<Payment> reviewQueue() {
+        return payments.findTop100ByRiskFlagOrderByCreatedAtAsc(RiskFlag.REVIEW);
     }
 
     /** The escrow account that holds this payment's funds (pre-V4 payments have none recorded). */

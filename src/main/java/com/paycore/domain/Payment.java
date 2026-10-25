@@ -20,6 +20,9 @@ public class Payment {
     private Instant createdAt;
     private Instant updatedAt;
     private UUID escrowAccountId;   // which escrow shard holds this payment's funds (null = original ESCROW)
+    @Enumerated(EnumType.STRING)
+    private RiskFlag riskFlag;
+    private String riskReason;
 
     protected Payment() {}
 
@@ -31,6 +34,7 @@ public class Payment {
         this.status = PaymentStatus.CREATED;
         this.createdAt = Instant.now();
         this.updatedAt = this.createdAt;
+        this.riskFlag = RiskFlag.NONE;
     }
 
     public void moveTo(PaymentStatus next) {
@@ -41,6 +45,19 @@ public class Payment {
         this.status = next;
         this.updatedAt = Instant.now();
     }
+
+    public void markForReview(String reason) {
+        this.riskFlag = RiskFlag.REVIEW;
+        this.riskReason = reason;
+    }
+
+    public void approveReview() {
+        this.riskFlag = RiskFlag.APPROVED;
+        this.updatedAt = Instant.now();
+    }
+
+    public RiskFlag getRiskFlag() { return riskFlag; }
+    public String getRiskReason() { return riskReason; }
 
     public void assignEscrow(UUID escrowAccountId) { this.escrowAccountId = escrowAccountId; }
 

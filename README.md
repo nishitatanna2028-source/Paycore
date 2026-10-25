@@ -2,8 +2,9 @@
 
 # PayCore
 
-**A concurrency-safe payment processing backend: double-entry ledger, idempotent APIs, signed webhooks and distributed rate limiting.**
+**A concurrency-safe payment processing backend: double-entry ledger, idempotent APIs, fraud screening, signed webhooks and distributed rate limiting.**
 
+![CI](https://github.com/nishitatanna2028-source/Paycore/actions/workflows/ci.yml/badge.svg)
 ![Java](https://img.shields.io/badge/Java-17-orange)
 ![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.2-6DB33F)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-336791)
@@ -13,8 +14,8 @@
 </div>
 
 PayCore is a small payment processor in the spirit of Stripe or Razorpay. It focuses on the hard parts of moving money
-reliably: never charging twice, never overdrawing under concurrency, never losing an event, and being able to prove that
-the books balance.
+reliably: never charging twice, never overdrawing under concurrency, never losing an event, screening for fraud, and being
+able to prove that the books balance.
 
 ---
 
@@ -26,10 +27,12 @@ the books balance.
 - [Authentication](#authentication)
 - [Payment Lifecycle](#payment-lifecycle)
 - [API Walkthrough](#api-walkthrough)
+- [Fraud Screening](#fraud-screening)
 - [Webhooks](#webhooks)
 - [Design Decisions](#design-decisions)
-- [Testing](#testing)
+- [Testing and CI](#testing-and-ci)
 - [Performance](#performance)
+- [Configuration Reference](#configuration-reference)
 - [Project Structure](#project-structure)
 - [Limitations & Roadmap](#limitations--roadmap)
 
@@ -45,8 +48,10 @@ the books balance.
 | **Concurrency safety** | Pessimistic row locks in a fixed order (no deadlocks), plus a database `CHECK` as a backstop. |
 | **Authentication** | Hashed, revocable merchant API keys with strict tenant isolation; separate admin key. |
 | **Rate limiting** | Redis token bucket executed atomically in Lua; `429` with `Retry-After`. |
+| **Fraud screening** | Sliding-window velocity rule (declines) and large-amount rule (holds for manual review), both enforced server-side. |
 | **Webhooks** | Transactional outbox, HMAC-signed requests, exponential backoff with jitter, dead-letter queue and replay. |
-| **Scalability work** | Escrow account sharding removed a single-row lock bottleneck: **4.4× throughput** (673 → 2,991 req/s) and **−80% p95 latency** in k6 load tests. |
+| **Scalability work** | Escrow sharding removed a single-row lock bottleneck: **4.4× throughput** (673 → 2,991 req/s) and **−80% p95 latency** in k6 load tests. |
+| **Automated tests + CI** | Integration tests run the real app against real PostgreSQL and Redis containers (Testcontainers) on every push. |
 
 ---
 
@@ -58,11 +63,12 @@ flowchart LR
 
     subgraph PayCore["PayCore (Spring Boot)"]
         Filter["ApiAuthFilter<br/>authentication + rate limit"] --> Controllers
-        Controllers --> Services["Payment, Ledger and<br/>Idempotency services"]
+        Controllers --> Services["Payment, Ledger, Fraud and<br/>Idempotency services"]
         Dispatcher["Webhook Dispatcher<br/>(SKIP LOCKED worker)"]
     end
 
     Filter <-->|"token bucket (Lua)"| Redis[(Redis)]
+    Services <-->|"velocity window (Lua)"| Redis
     Filter -->|"API key hash lookup"| PG[(PostgreSQL)]
     Services -->|"ONE transaction:<br/>ledger + state + outbox event"| PG
     Dispatcher <-->|"claim and update events"| PG
@@ -95,7 +101,7 @@ docker compose up --build
 
 | Caller | Header | Used for |
 |---|---|---|
-| **Admin** | `X-Admin-Key: dev-admin-key` (set `ADMIN_KEY` to change) | Create accounts, deposits, issue/revoke API keys, `/admin/**` |
+| **Admin** | `X-Admin-Key: dev-admin-key` (set `ADMIN_KEY` to change) | Create accounts, deposits, issue/revoke API keys, review queue, `/admin/**` |
 | **Merchant** | `Authorization: Bearer pk_...` | `/payments/**` and `/webhooks/**`, scoped to that merchant only |
 
 - API keys are 256-bit random values. Only a SHA-256 hash is stored and the key is shown **once**.
@@ -117,14 +123,17 @@ stateDiagram-v2
     REFUNDED --> [*]
 ```
 
+A payment created with `riskFlag: REVIEW` cannot be authorized until an admin approves it (see
+[Fraud Screening](#fraud-screening)).
+
 ### Money movement
 
 | Operation | Source | Destination |
 |---|---|---|
 | Deposit | `FUNDING` | Customer |
-| Authorize | Customer | Escrow |
-| Capture | Escrow | Merchant |
-| Void | Escrow | Customer |
+| Authorize | Customer | Escrow shard |
+| Capture | Escrow shard | Merchant |
+| Void | Escrow shard | Customer |
 | Refund | Merchant | Customer |
 
 > **Precision:** all amounts are integers in minor units (paise). Floating point is never used for money.
@@ -193,7 +202,9 @@ curl -s localhost:8080/admin/reconcile -H "$ADMIN"
 | `POST` | `/admin/merchants/{id}/api-keys` | Admin | Issue an API key (shown once) |
 | `DELETE` | `/admin/api-keys/{id}` | Admin | Revoke an API key |
 | `GET` | `/admin/reconcile` | Admin | Verify balances against the ledger |
-| `POST` | `/payments` | Merchant | Create a payment (idempotent) |
+| `GET` | `/admin/review-queue` | Admin | Payments held for manual review |
+| `POST` | `/admin/payments/{id}/approve` | Admin | Release a payment held for review |
+| `POST` | `/payments` | Merchant | Create a payment (idempotent; fraud-screened) |
 | `GET` | `/payments/{id}` | Merchant | Read a payment you own |
 | `POST` | `/payments/{id}/authorize \| capture \| void \| refund` | Merchant | State transitions (idempotent) |
 | `POST` `GET` | `/webhooks` | Merchant | Register / list webhook endpoints |
@@ -203,10 +214,29 @@ curl -s localhost:8080/admin/reconcile -H "$ADMIN"
 
 ---
 
+## Fraud Screening
+
+Every `POST /payments` is screened **before** the payment is created.
+
+| Rule | Trigger | Outcome |
+|---|---|---|
+| **Velocity** | More than 60 payment attempts by one customer within 60 seconds | Declined with `422`; nothing is created |
+| **Large amount** | Amount ≥ ₹1,00,000 (10,000,000 paise) | Payment is created with `riskFlag: REVIEW`; `authorize` returns `409` until an admin approves it |
+
+- **How the velocity window works:** a Redis sorted set per customer, updated by one atomic Lua script (trim old entries,
+  add this attempt, count). It is a true sliding window, so there is no boundary effect at the minute mark, and it works
+  across several app servers. Declined attempts still count, so a card-testing bot stays blocked while it keeps trying.
+- **Review workflow:** `GET /admin/review-queue` lists held payments; `POST /admin/payments/{id}/approve` releases one and
+  emits a `payment.review_approved` webhook. Merchants cannot approve their own reviews.
+- **Availability over strictness:** if Redis is unreachable the velocity check fails open (like the rate limiter).
+- Thresholds are configurable (see [Configuration Reference](#configuration-reference)).
+
+---
+
 ## Webhooks
 
 Register an endpoint with `POST /webhooks` and PayCore notifies it of `payment.created`, `payment.authorized`,
-`payment.captured`, `payment.voided` and `payment.refunded`.
+`payment.captured`, `payment.voided`, `payment.refunded` and `payment.review_approved`.
 
 ### Delivery guarantees
 
@@ -246,8 +276,8 @@ transfers can never deadlock. Pessimistic locking was chosen over optimistic loc
 
 ### 3. Escrow sharding
 All authorizations originally locked one shared escrow row, serializing every payment in the system. Held funds can now
-be spread across up to 16 escrow accounts (`ESCROW_SHARDS`, default 16). The shard is derived from the payment id at authorization
-and stored on the payment so capture and void use the same account. See [Performance](#performance) for measurements.
+be spread across up to 16 escrow accounts (`ESCROW_SHARDS`, default 16). The shard is derived from the payment id at
+authorization and stored on the payment so capture and void use the same account. See [Performance](#performance).
 
 ### 4. Idempotency inside the transaction
 `INSERT ... ON CONFLICT DO NOTHING` on the key runs in the **same transaction** as the business action.
@@ -267,9 +297,10 @@ Events are inserted in the same transaction as the payment change, which removes
 if and only if the payment change committed. A worker claims due rows with `FOR UPDATE SKIP LOCKED`, so several app
 instances can run safely, and HTTP calls are made outside any database transaction.
 
-### 7. Rate limiting that fails open
-A token bucket per API key lives in Redis and runs as one Lua script (atomic, and it uses Redis' own clock so servers
-cannot disagree about time). If Redis is unreachable the limiter allows traffic rather than taking payments down.
+### 7. Rate limiting and fraud checks that fail open
+The token bucket (per API key) and the fraud velocity window both live in Redis and run as single Lua scripts (atomic,
+and using Redis' own clock so servers cannot disagree about time). If Redis is unreachable they allow traffic rather than
+taking payments down.
 
 ### 8. SSRF protection
 Merchants choose the URLs the server calls. Webhook targets are rejected if they resolve to private, loopback or
@@ -278,32 +309,41 @@ link-local addresses (checked at registration and again at delivery), and redire
 ### 9. Crash safety
 Each transfer is one PostgreSQL transaction, so a crash cannot leave a debit without its credit.
 
+### 10. Fraud decisions are made server-side, before money moves
+Screening happens inside the payment-creation transaction. A decline creates nothing; a review hold is stored on the
+payment itself and enforced in `authorize`, so it cannot be bypassed by a client.
+
 ---
 
-## Testing
+## Testing and CI
+
+### Automated Java integration tests
+
+`mvn verify` boots the **whole application** against real PostgreSQL 15 and Redis 7 containers
+([Testcontainers](https://testcontainers.com)) and exercises it over HTTP. These tests run on every push through
+GitHub Actions (`.github/workflows/ci.yml`).
+
+| Test class | What it proves |
+|---|---|
+| `PaymentApiTest` | 20 parallel requests with one idempotency key create one payment; same key with a different body is rejected; 30 parallel authorizations on a ₹1.00 balance succeed exactly 10 times and never overdraw; 10 parallel captures move money once; full lifecycle and illegal transitions; void releases funds; missing/fake/revoked keys are rejected; merchants cannot see or touch each other's payments; idempotency keys are scoped per merchant; the books balance afterwards |
+| `WebhookDeliveryTest` | A receiver that fails twice still gets the event; every attempt carries a valid HMAC signature; the event ends `DELIVERED`; an unreachable endpoint ends `DEAD` after 5 attempts and can be replayed; invalid URLs are rejected |
+| `FraudRulesTest` | The 6th payment in a minute is declined while other customers are unaffected; a large payment is held for review, blocked from authorizing, invisible to merchant approval, approved by an admin, then authorizes |
+
+Running them locally needs JDK 17, Maven and Docker running: `mvn verify`. Without a local JDK, push to GitHub and read
+the result in the **Actions** tab.
+
+### End-to-end scripts against the running stack
 
 Start the stack, then run:
 
 ```bash
-python scripts/concurrency_test.py   # core correctness, security and rate limiting
-python scripts/webhook_test.py       # webhook delivery, retries, DLQ and replay
+python scripts/concurrency_test.py   # core correctness, security and rate limiting (16 checks)
+python scripts/webhook_test.py       # webhook delivery, retries, DLQ and replay (13 checks)
+python scripts/fraud_test.py         # fraud rules and the review workflow (10 checks)
 ```
 
-| Suite | What it proves |
-|---|---|
-| Idempotency race | 20 parallel requests with one key create exactly one payment |
-| Key reuse | Same key with a different body is rejected (`422`) |
-| Overdraw race | 30 parallel authorizations on a ₹1.00 balance: exactly 10 succeed, balance never negative |
-| Capture race | 10 parallel captures move money exactly once |
-| State machine | Refund before capture is rejected (`409`) |
-| Authentication | Missing, fake and revoked keys are rejected; merchant keys cannot call admin endpoints |
-| Tenant isolation | A merchant cannot read, modify or create payments for another merchant |
-| Idempotency scoping | The same key string from two merchants yields two separate payments |
-| Rate limiting | A burst of 1000 requests is throttled with `429` and `Retry-After` |
-| Reconciliation | Total debits equal total credits and every balance matches its ledger |
-| Webhook retries | A receiver that fails the first two attempts still gets every event |
-| Webhook signatures | Every delivery verifies against the endpoint secret |
-| Dead-letter queue | An unreachable endpoint ends `DEAD`; replay delivers it once the endpoint is back |
+`concurrency_test.py` also verifies rate limiting (a burst of 1000 requests is throttled with `429` and `Retry-After`),
+so keep the rate limiter on when running it.
 
 ---
 
@@ -313,9 +353,10 @@ Load is generated with [k6](https://k6.io) running inside Docker Compose. Each v
 checkout (create, authorize, capture) against its own customer and merchant, so the only shared resource is the escrow
 account. This isolates the escrow lock as the variable under test.
 
-**Step 0: switch off per-key rate limiting for the test.** Each virtual user hammers a single merchant key, so the
-limiter (50 req/s per key) would reject most requests and hide the real behaviour. In `docker-compose.yml`, remove the
-`#` from the two `RATE_LIMIT_*` lines under `app`, then apply it:
+**Step 0: switch off per-key rate limiting and the fraud velocity rule for the test.** Each virtual user hammers a
+single merchant key and a single customer, so the limiter (50 req/s per key) and the velocity rule (60 payments/min per
+customer) would reject most requests and hide the real behaviour. In `docker-compose.yml`, remove the `#` from the three
+lines under `app` (`RATE_LIMIT_CAPACITY`, `RATE_LIMIT_REFILL`, `FRAUD_ENABLED`), then apply it:
 
 ```bash
 docker compose up -d app
@@ -339,16 +380,16 @@ docker compose --profile loadtest run --rm -e LABEL=sharded k6
 python loadtest/compare.py baseline sharded
 ```
 
-When finished, put the `#` back on the two `RATE_LIMIT_*` lines and run `docker compose up -d app` again.
+When finished, put the `#` back on the three lines and run `docker compose up -d app` again.
 
 > A run with more than 5% errors is flagged as invalid by the script, and `compare.py` refuses to compare it.
 
 ### Results
 
 > **Setup:** 50 concurrent virtual users for 60 s, each with its own customer and merchant, 0% errors in both runs.
-> Per-key rate limiting was switched off for the test. App, PostgreSQL, Redis and k6 all ran on one machine
-> (Docker Desktop), so absolute numbers depend on hardware; the **relative** change is the finding.
-> **Measured on:** _CPU / RAM / OS (fill in)_.
+> Rate limiting and the fraud velocity rule were switched off for the test. The app, PostgreSQL, Redis and k6 all ran on
+> one machine under Docker Desktop, so absolute numbers depend on hardware; the **relative** change is the finding.
+> **Measured on:** Intel Core Ultra 7 255H (16 cores), 31.5 GB RAM, Windows 11, Docker Desktop.
 
 | Metric | Single escrow | 16 escrow shards | Change |
 |---|---:|---:|---:|
@@ -375,30 +416,53 @@ Raw results: [`loadtest/results/baseline.json`](loadtest/results/baseline.json) 
 
 ---
 
+## Configuration Reference
+
+All settings are environment variables with safe defaults (see `src/main/resources/application.yml`).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DB_URL`, `DB_USER`, `DB_PASSWORD` | local PostgreSQL | Database connection |
+| `REDIS_HOST` | `localhost` | Redis host |
+| `ADMIN_KEY` | `dev-admin-key` | Admin API key. **Change it outside local development.** |
+| `RATE_LIMIT_CAPACITY` / `RATE_LIMIT_REFILL` | `100` / `50` | Token bucket burst size and refill per second, per API key |
+| `ESCROW_SHARDS` | `16` | Escrow accounts to spread held funds over (1 to 16) |
+| `FRAUD_ENABLED` | `true` | Turn fraud screening on or off |
+| `FRAUD_VELOCITY_MAX` | `60` | Payment attempts per customer per minute before declining |
+| `FRAUD_REVIEW_AMOUNT` | `10000000` | Minor units; at or above this a payment is held for review |
+| `WEBHOOK_ALLOW_PRIVATE` | `false` | Allow webhook targets on private addresses. **Local testing only.** |
+| `WEBHOOK_MAX_ATTEMPTS` / `WEBHOOK_BASE_DELAY_SECONDS` | `8` / `2` | Retry budget and first retry delay |
+
+---
+
 ## Project Structure
 
 ```text
 paycore/
+├── .github/workflows/ci.yml    # build + integration tests on every push
 ├── docker-compose.yml          # app, PostgreSQL, Redis (+ k6 under the "loadtest" profile)
 ├── Dockerfile
 ├── pom.xml
-├── docs/PROJECT_CONTEXT.md     # full project context / handoff notes
+├── docs/PROJECT_CONTEXT.md     # detailed technical notes / handoff
 ├── loadtest/                   # k6 script, comparison tool, saved results
-├── scripts/                    # concurrency_test.py, webhook_test.py
-└── src/main
-    ├── resources
-    │   ├── application.yml
-    │   ├── redis/token_bucket.lua
-    │   └── db/migration/       # V1 core, V2 api keys, V3 webhooks, V4 escrow shards
-    └── java/com/paycore
-        ├── common/             # ApiException, system account ids
-        ├── config/             # OpenAPI and scheduling config
-        ├── domain/             # Account, Payment, LedgerEntry, PaymentStatus
-        ├── repo/               # Spring Data repositories (with row-lock queries)
-        ├── security/           # auth filter, API keys, Redis rate limiter
-        ├── service/            # Ledger, Payment, Account, Idempotency, Reconciliation
-        ├── webhook/            # outbox service, dispatcher, signer, SSRF guard
-        └── web/                # REST controllers and error handling
+├── scripts/                    # concurrency_test.py, webhook_test.py, fraud_test.py
+└── src
+    ├── main
+    │   ├── resources
+    │   │   ├── application.yml
+    │   │   ├── redis/          # token_bucket.lua, fraud_velocity.lua
+    │   │   └── db/migration/   # V1 core, V2 api keys, V3 webhooks, V4 escrow shards, V5 fraud
+    │   └── java/com/paycore
+    │       ├── common/         # ApiException, system account ids
+    │       ├── config/         # OpenAPI and scheduling config
+    │       ├── domain/         # Account, Payment, LedgerEntry, PaymentStatus, RiskFlag
+    │       ├── fraud/          # velocity + large-amount screening
+    │       ├── repo/           # Spring Data repositories (with row-lock queries)
+    │       ├── security/       # auth filter, API keys, Redis rate limiter
+    │       ├── service/        # Ledger, Payment, Account, Idempotency, Reconciliation
+    │       ├── webhook/        # outbox service, dispatcher, signer, SSRF guard
+    │       └── web/            # REST controllers and error handling
+    └── test/java/com/paycore   # Testcontainers integration tests
 ```
 
 ---
@@ -409,9 +473,10 @@ paycore/
 |---|---|
 | Escrow contention | Mitigated by sharding; merchant and customer rows can still be hot for very busy single accounts |
 | Idempotency keys | Scoped per caller but never expire; a retention job is needed |
-| Webhooks | At-least-once and unordered; one dispatcher instance polls (safe to run several) |
+| Webhooks | At-least-once and unordered; one dispatcher polls per instance (safe to run several) |
 | API key lookup | One database query per request; a short-lived cache would help |
 | Webhook secrets | Stored in plaintext because the server must sign with them |
+| Fraud rules | Two simple rules; a held payment can only be approved, not rejected |
 
 **Roadmap**
 
@@ -419,8 +484,8 @@ paycore/
 - [x] API-key authentication, tenant isolation, Redis rate limiting
 - [x] Webhooks with outbox, signing, retries, dead-letter queue and replay
 - [x] k6 load test and escrow sharding
-- [ ] Java integration tests (Testcontainers) and CI
-- [ ] Fraud rules (velocity and amount checks)
+- [x] Fraud rules with a manual review workflow
+- [x] Java integration tests (Testcontainers) and CI
 - [ ] Metrics and dashboards (Micrometer, Prometheus, Grafana)
 - [ ] Public deployment
 

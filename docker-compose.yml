@@ -37,10 +37,11 @@ services:
       WEBHOOK_MAX_ATTEMPTS: "5"
       WEBHOOK_BASE_DELAY_SECONDS: "1"
       ESCROW_SHARDS: "16"       # 1 = single escrow account (baseline), up to 16 = sharded
-      # --- LOAD TEST ONLY: remove the two leading "#" so per-key rate limiting doesn't throttle k6,
-      # then run `docker compose up -d app`. Put the "#" back afterwards (concurrency_test.py check 10 needs the limiter).
+      # --- LOAD TEST ONLY: remove the leading "#" on all three lines so rate limiting and the fraud velocity rule don't throttle k6,
+      # then run `docker compose up -d app`. Put the "#" back afterwards (concurrency_test.py check 10 needs the limiter, fraud_test.py needs the fraud rules).
       # RATE_LIMIT_CAPACITY: "1000000"
       # RATE_LIMIT_REFILL: "1000000"
+      # FRAUD_ENABLED: "false"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports: ["8080:8080"]

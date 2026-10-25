@@ -24,6 +24,10 @@ paycore:
   rate-limit:
     capacity: ${RATE_LIMIT_CAPACITY:100}          # max burst
     refill-per-second: ${RATE_LIMIT_REFILL:50}    # sustained requests/sec per API key
+  fraud:
+    enabled: ${FRAUD_ENABLED:true}
+    velocity-max-per-minute: ${FRAUD_VELOCITY_MAX:60}   # per customer; above this = declined
+    review-amount: ${FRAUD_REVIEW_AMOUNT:10000000}       # minor units (INR 100,000); at or above = held for review
   webhooks:
     allow-private-targets: ${WEBHOOK_ALLOW_PRIVATE:false}   # SSRF guard; only enable for local testing
     max-attempts: ${WEBHOOK_MAX_ATTEMPTS:8}
