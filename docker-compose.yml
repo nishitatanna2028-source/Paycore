@@ -32,4 +32,10 @@ services:
       DB_PASSWORD: paycore
       REDIS_HOST: redis
       ADMIN_KEY: dev-admin-key
+      # dev-only webhook settings: allow localhost targets, and fail fast so the dead-letter test is quick
+      WEBHOOK_ALLOW_PRIVATE: "true"
+      WEBHOOK_MAX_ATTEMPTS: "5"
+      WEBHOOK_BASE_DELAY_SECONDS: "1"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports: ["8080:8080"]

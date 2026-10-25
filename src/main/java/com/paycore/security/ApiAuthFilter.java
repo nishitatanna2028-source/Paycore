@@ -14,7 +14,7 @@ import java.util.Optional;
 
 /**
  * Runs before every controller:
- *   1. /payments/**            -> needs a merchant API key   (Authorization: Bearer pk_...)
+ *   1. /payments/**, /webhooks/** -> needs a merchant API key   (Authorization: Bearer pk_...)
  *   2. everything else         -> needs the admin key         (X-Admin-Key: ...)
  *   3. then rate-limits per API key (or per admin)
  * Swagger/OpenAPI pages are public.
@@ -46,7 +46,7 @@ public class ApiAuthFilter extends OncePerRequestFilter {
         AuthContext auth;
         String identity;
 
-        if (path.startsWith("/payments")) {
+        if (path.startsWith("/payments") || path.startsWith("/webhooks")) {
             String rawKey = bearerToken(req);
             Optional<ApiKeyService.KeyInfo> info = rawKey == null ? Optional.empty() : apiKeys.authenticate(rawKey);
             if (info.isEmpty()) {

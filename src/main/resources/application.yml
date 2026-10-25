@@ -23,3 +23,11 @@ paycore:
   rate-limit:
     capacity: ${RATE_LIMIT_CAPACITY:100}          # max burst
     refill-per-second: ${RATE_LIMIT_REFILL:50}    # sustained requests/sec per API key
+  webhooks:
+    allow-private-targets: ${WEBHOOK_ALLOW_PRIVATE:false}   # SSRF guard; only enable for local testing
+    max-attempts: ${WEBHOOK_MAX_ATTEMPTS:8}
+    base-delay-seconds: ${WEBHOOK_BASE_DELAY_SECONDS:2}     # retry delay doubles each attempt
+    max-delay-seconds: 3600
+    lease-seconds: 60                                       # a claimed event not finished in this time is retried
+    batch-size: 20
+    poll-interval-ms: 1000
