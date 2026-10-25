@@ -36,6 +36,25 @@ services:
       WEBHOOK_ALLOW_PRIVATE: "true"
       WEBHOOK_MAX_ATTEMPTS: "5"
       WEBHOOK_BASE_DELAY_SECONDS: "1"
+      ESCROW_SHARDS: "16"       # 1 = single escrow account (baseline), up to 16 = sharded
+      # --- LOAD TEST ONLY: remove the two leading "#" so per-key rate limiting doesn't throttle k6,
+      # then run `docker compose up -d app`. Put the "#" back afterwards (concurrency_test.py check 10 needs the limiter).
+      # RATE_LIMIT_CAPACITY: "1000000"
+      # RATE_LIMIT_REFILL: "1000000"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports: ["8080:8080"]
+
+  # Load generator. Not started by default; run with:  docker compose --profile loadtest run --rm k6
+  k6:
+    image: grafana/k6:0.52.0
+    profiles: ["loadtest"]
+    user: "0"
+    depends_on:
+      - app
+    volumes:
+      - ./loadtest:/loadtest
+    environment:
+      BASE_URL: http://app:8080
+      ADMIN_KEY: dev-admin-key
+    command: ["run", "/loadtest/payment_flow.js"]

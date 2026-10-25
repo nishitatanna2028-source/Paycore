@@ -1,5 +1,6 @@
 package com.paycore.domain;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.paycore.common.ApiException;
 import jakarta.persistence.*;
 import org.springframework.http.HttpStatus;
@@ -18,6 +19,7 @@ public class Payment {
     private PaymentStatus status;
     private Instant createdAt;
     private Instant updatedAt;
+    private UUID escrowAccountId;   // which escrow shard holds this payment's funds (null = original ESCROW)
 
     protected Payment() {}
 
@@ -39,6 +41,11 @@ public class Payment {
         this.status = next;
         this.updatedAt = Instant.now();
     }
+
+    public void assignEscrow(UUID escrowAccountId) { this.escrowAccountId = escrowAccountId; }
+
+    @JsonIgnore
+    public UUID getEscrowAccountId() { return escrowAccountId; }
 
     public UUID getId() { return id; }
     public UUID getCustomerId() { return customerId; }

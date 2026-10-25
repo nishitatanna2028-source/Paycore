@@ -6,6 +6,7 @@ import com.paycore.domain.*;
 import com.paycore.repo.AccountRepository;
 import com.paycore.repo.PaymentRepository;
 import com.paycore.webhook.WebhookService;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -26,13 +27,16 @@ public class PaymentService {
     private final AccountRepository accounts;
     private final LedgerService ledger;
     private final WebhookService webhooks;
+    private final int escrowShards;
 
     public PaymentService(PaymentRepository payments, AccountRepository accounts,
-                          LedgerService ledger, WebhookService webhooks) {
+                          LedgerService ledger, WebhookService webhooks,
+                          @Value("${paycore.escrow-shards:1}") int escrowShards) {
         this.payments = payments;
         this.accounts = accounts;
         this.ledger = ledger;
         this.webhooks = webhooks;
+        this.escrowShards = Math.min(Math.max(escrowShards, 1), SystemAccounts.MAX_ESCROW_SHARDS);
     }
 
     @Transactional
@@ -63,7 +67,9 @@ public class PaymentService {
         Payment p = lock(id);
         assertOwner(p, merchantId);
         p.moveTo(PaymentStatus.AUTHORIZED);
-        ledger.transfer(p.getCustomerId(), SystemAccounts.ESCROW, p.getAmount(), "AUTHORIZE", p.getId());
+        UUID escrow = SystemAccounts.escrowFor(p.getId(), escrowShards);
+        p.assignEscrow(escrow);
+        ledger.transfer(p.getCustomerId(), escrow, p.getAmount(), "AUTHORIZE", p.getId());
         webhooks.enqueue(p.getMerchantId(), "payment.authorized", p);
         return p;
     }
@@ -73,7 +79,7 @@ public class PaymentService {
         Payment p = lock(id);
         assertOwner(p, merchantId);
         p.moveTo(PaymentStatus.CAPTURED);
-        ledger.transfer(SystemAccounts.ESCROW, p.getMerchantId(), p.getAmount(), "CAPTURE", p.getId());
+        ledger.transfer(escrowOf(p), p.getMerchantId(), p.getAmount(), "CAPTURE", p.getId());
         webhooks.enqueue(p.getMerchantId(), "payment.captured", p);
         return p;
     }
@@ -83,7 +89,7 @@ public class PaymentService {
         Payment p = lock(id);
         assertOwner(p, merchantId);
         p.moveTo(PaymentStatus.VOIDED);
-        ledger.transfer(SystemAccounts.ESCROW, p.getCustomerId(), p.getAmount(), "VOID", p.getId());
+        ledger.transfer(escrowOf(p), p.getCustomerId(), p.getAmount(), "VOID", p.getId());
         webhooks.enqueue(p.getMerchantId(), "payment.voided", p);
         return p;
     }
@@ -96,6 +102,11 @@ public class PaymentService {
         ledger.transfer(p.getMerchantId(), p.getCustomerId(), p.getAmount(), "REFUND", p.getId());
         webhooks.enqueue(p.getMerchantId(), "payment.refunded", p);
         return p;
+    }
+
+    /** The escrow account that holds this payment's funds (pre-V4 payments have none recorded). */
+    private UUID escrowOf(Payment p) {
+        return p.getEscrowAccountId() != null ? p.getEscrowAccountId() : SystemAccounts.ESCROW;
     }
 
     /** Another merchant's payment looks exactly like a payment that doesn't exist. */

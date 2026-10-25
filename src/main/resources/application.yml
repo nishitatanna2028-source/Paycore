@@ -20,6 +20,7 @@ spring:
 
 paycore:
   admin-key: ${ADMIN_KEY:dev-admin-key}
+  escrow-shards: ${ESCROW_SHARDS:16}    # 1 = single escrow account, up to 16 = spread lock contention
   rate-limit:
     capacity: ${RATE_LIMIT_CAPACITY:100}          # max burst
     refill-per-second: ${RATE_LIMIT_REFILL:50}    # sustained requests/sec per API key
