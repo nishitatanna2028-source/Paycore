@@ -104,6 +104,7 @@ src/test/java/com/paycore/FraudRulesTest.java            3 tests (lowers velocit
 
 - Maven (no wrapper), Java 17, Spring Boot **3.2.5**. Dependencies: web, data-jpa, validation, data-redis, flyway-core,
   postgresql (runtime), springdoc-openapi-starter-webmvc-ui 2.5.0, starter-test (test), `org.testcontainers:postgresql` (test).
+- `pom.xml` pins `<testcontainers.version>1.21.4</testcontainers.version>` (overrides Spring Boot's managed 1.19.x; see section 12). Keep it >= 1.21.4 or move to the 2.x line (artifact/package names change in 2.x).
 - No Lombok, no Spring Security, no actuator/micrometer yet (planned).
 - Docker image build skips test **compilation** (`-Dmaven.test.skip=true`) so a test bug can never break the image.
   Tests run only in CI / `mvn verify`.
@@ -308,7 +309,7 @@ from a latch. Test classes end in `Test` (Surefire default). Datasets are isolat
 |---|---|
 | Steps 1 to 4 (ledger, auth, rate limit, webhooks, sharding, k6) | **Run and passing on the user's machine** (all Python scripts green at those steps; k6 results recorded) |
 | Step 5 (fraud rules, Java integration tests, CI) | **Delivered, not yet run by the user.** Verified here: Java syntax (`javac`), tests type-checked against stubs, both Lua scripts against a fake Redis, YAML/XML/Python syntax |
-| First CI run | Unknown until pushed; likely first failures would be compile errors in main code or Testcontainers image pulls |
+| First CI run | **Failed**: every Java test died with `ExceptionInInitializerError` because Testcontainers 1.19 could not talk to Docker Engine 29 on the GitHub runner ("client version 1.32 is too old"). Fixed by pinning Testcontainers 1.21.4 (`paycore-step5-fix.zip`). Re-run result pending; any further CI failure needs the FIRST `Caused by:` / `[ERROR]` line, not the tail of the log |
 
 ### Measured results (real, from the user's machine)
 50 VUs, 60 s, rate limit and fraud off, 0% errors:
@@ -331,6 +332,7 @@ Resume bullet (measured): "Profiled the payment path with k6 (50 concurrent user
 - **OneDrive** causes git rebase/Docker file-lock hiccups ("Deletion of directory failed"); answer `n`. Project now at `C:\dev\paycore`.
 - **Flyway**: never edit applied migrations; V6 is next.
 - **Docker image build** must not compile tests (`-Dmaven.test.skip=true`).
+- **Testcontainers vs Docker 29 (hit in CI)**: GitHub's ubuntu runners ship Docker Engine 29 (minimum API 1.44). Testcontainers < 1.21.4 uses API 1.32 and fails with `Could not find a valid Docker environment ... client version 1.32 is too old`, surfacing in JUnit as `ExceptionInInitializerError` / `NoClassDefFoundError: Could not initialize class ...Test`. Fix = `testcontainers.version` 1.21.4 in the pom. When CI shows that error pattern in a test base class's static initializer, suspect container startup first.
 - **Testcontainers**: use the singleton-container pattern; do not use `@Container` in the abstract base (contexts are cached across classes).
 - **`@LocalServerPort`** package differs across Boot versions; the tests use `@Value("${local.server.port}")`.
 - **TestRestTemplate/HttpURLConnection** mishandles 401 on POST; tests use the JDK `HttpClient` instead.
@@ -386,3 +388,4 @@ turn off the dev webhook overrides. Add a "Live demo" link to the README; consid
 | `paycore-step3.zip` | Webhooks (outbox, dispatcher, signing, SSRF guard, DLQ, replay), V3, `webhook_test.py`, first context file |
 | `paycore-step4.zip`, `-fix`, `-results` | k6 load test, escrow sharding V4, README rewrite, rate-limit/fraud guard, measured results, shards default 16 |
 | `paycore-step5.zip` | Fraud rules V5 + `fraud_test.py`, Testcontainers tests, GitHub Actions CI, Dockerfile test-skip, README + this file rewritten |
+| `paycore-step5-fix.zip` | `pom.xml` pins Testcontainers 1.21.4 (fixes CI vs Docker Engine 29); this file updated |
