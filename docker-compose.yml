@@ -36,6 +36,7 @@ services:
       WEBHOOK_ALLOW_PRIVATE: "true"
       WEBHOOK_MAX_ATTEMPTS: "5"
       WEBHOOK_BASE_DELAY_SECONDS: "1"
+      MANAGEMENT_SERVER_PORT: "8081"   # metrics/health live on their own port, outside the public API
       ESCROW_SHARDS: "16"       # 1 = single escrow account (baseline), up to 16 = sharded
       # --- LOAD TEST ONLY: remove the leading "#" on all three lines so rate limiting and the fraud velocity rule don't throttle k6,
       # then run `docker compose up -d app`. Put the "#" back afterwards (concurrency_test.py check 10 needs the limiter, fraud_test.py needs the fraud rules).
@@ -44,7 +45,9 @@ services:
       # FRAUD_ENABLED: "false"
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    ports: ["8080:8080"]
+    ports:
+      - "8080:8080"   # public API
+      - "8081:8081"   # metrics (local debugging only; never publish this port in production)
 
   # Load generator. Not started by default; run with:  docker compose --profile loadtest run --rm k6
   k6:
@@ -59,3 +62,28 @@ services:
       BASE_URL: http://app:8080
       ADMIN_KEY: dev-admin-key
     command: ["run", "/loadtest/payment_flow.js"]
+
+  # Monitoring. Not started by default; run with:  docker compose --profile monitoring up -d
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    profiles: ["monitoring"]
+    depends_on:
+      - app
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    profiles: ["monitoring"]
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin                      # local demo only
+      GF_AUTH_ANONYMOUS_ENABLED: "true"                      # open the dashboard without logging in
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/paycore.json
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]

@@ -6,6 +6,7 @@ import com.paycore.domain.*;
 import com.paycore.repo.AccountRepository;
 import com.paycore.repo.PaymentRepository;
 import com.paycore.fraud.FraudService;
+import com.paycore.metrics.BusinessMetrics;
 import com.paycore.webhook.WebhookService;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
@@ -30,16 +31,19 @@ public class PaymentService {
     private final LedgerService ledger;
     private final WebhookService webhooks;
     private final FraudService fraud;
+    private final BusinessMetrics metrics;
     private final int escrowShards;
 
     public PaymentService(PaymentRepository payments, AccountRepository accounts,
                           LedgerService ledger, WebhookService webhooks, FraudService fraud,
+                          BusinessMetrics metrics,
                           @Value("${paycore.escrow-shards:1}") int escrowShards) {
         this.payments = payments;
         this.accounts = accounts;
         this.ledger = ledger;
         this.webhooks = webhooks;
         this.fraud = fraud;
+        this.metrics = metrics;
         this.escrowShards = Math.min(Math.max(escrowShards, 1), SystemAccounts.MAX_ESCROW_SHARDS);
     }
 
@@ -58,6 +62,8 @@ public class PaymentService {
         if (risk.flag() == RiskFlag.REVIEW) payment.markForReview(risk.reason());
         Payment saved = payments.save(payment);
         webhooks.enqueue(merchantId, "payment.created", saved);
+        metrics.transition("created");
+        if (risk.flag() == RiskFlag.REVIEW) metrics.fraudReviewHeld();
         return saved;
     }
 
@@ -81,6 +87,7 @@ public class PaymentService {
         p.assignEscrow(escrow);
         ledger.transfer(p.getCustomerId(), escrow, p.getAmount(), "AUTHORIZE", p.getId());
         webhooks.enqueue(p.getMerchantId(), "payment.authorized", p);
+        metrics.transition("authorized");
         return p;
     }
 
@@ -91,6 +98,7 @@ public class PaymentService {
         p.moveTo(PaymentStatus.CAPTURED);
         ledger.transfer(escrowOf(p), p.getMerchantId(), p.getAmount(), "CAPTURE", p.getId());
         webhooks.enqueue(p.getMerchantId(), "payment.captured", p);
+        metrics.transition("captured");
         return p;
     }
 
@@ -101,6 +109,7 @@ public class PaymentService {
         p.moveTo(PaymentStatus.VOIDED);
         ledger.transfer(escrowOf(p), p.getCustomerId(), p.getAmount(), "VOID", p.getId());
         webhooks.enqueue(p.getMerchantId(), "payment.voided", p);
+        metrics.transition("voided");
         return p;
     }
 
@@ -111,6 +120,7 @@ public class PaymentService {
         p.moveTo(PaymentStatus.REFUNDED);
         ledger.transfer(p.getMerchantId(), p.getCustomerId(), p.getAmount(), "REFUND", p.getId());
         webhooks.enqueue(p.getMerchantId(), "payment.refunded", p);
+        metrics.transition("refunded");
         return p;
     }
 
@@ -123,6 +133,7 @@ public class PaymentService {
         }
         p.approveReview();
         webhooks.enqueue(p.getMerchantId(), "payment.review_approved", p);
+        metrics.transition("review_approved");
         return p;
     }
 

@@ -1,5 +1,6 @@
 package com.paycore.webhook;
 
+import com.paycore.metrics.BusinessMetrics;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -37,6 +38,7 @@ public class WebhookDispatcher {
     private static final Logger log = LoggerFactory.getLogger(WebhookDispatcher.class);
 
     private final JdbcTemplate jdbc;
+    private final BusinessMetrics metrics;
     private final int maxAttempts;
     private final int baseDelaySeconds;
     private final int maxDelaySeconds;
@@ -50,7 +52,7 @@ public class WebhookDispatcher {
             .build();
     private final ExecutorService pool = Executors.newFixedThreadPool(8);
 
-    public WebhookDispatcher(JdbcTemplate jdbc,
+    public WebhookDispatcher(JdbcTemplate jdbc, BusinessMetrics metrics,
                              @Value("${paycore.webhooks.max-attempts:8}") int maxAttempts,
                              @Value("${paycore.webhooks.base-delay-seconds:2}") int baseDelaySeconds,
                              @Value("${paycore.webhooks.max-delay-seconds:3600}") int maxDelaySeconds,
@@ -58,6 +60,7 @@ public class WebhookDispatcher {
                              @Value("${paycore.webhooks.batch-size:20}") int batchSize,
                              @Value("${paycore.webhooks.allow-private-targets:false}") boolean allowPrivate) {
         this.jdbc = jdbc;
+        this.metrics = metrics;
         this.maxAttempts = maxAttempts;
         this.baseDelaySeconds = baseDelaySeconds;
         this.maxDelaySeconds = maxDelaySeconds;
@@ -109,6 +112,7 @@ public class WebhookDispatcher {
         UUID endpointId = (UUID) row.get("endpoint_id");
         int attempts = ((Number) row.get("attempts")).intValue();
         String body = row.get("payload").toString();
+        final long started = System.nanoTime();
         try {
             Map<String, Object> endpoint = jdbc.queryForMap(
                     "SELECT url, secret, active FROM webhook_endpoints WHERE id = ?", endpointId);
@@ -134,14 +138,18 @@ public class WebhookDispatcher {
 
             HttpResponse<Void> response = http.send(request, HttpResponse.BodyHandlers.discarding());
             int code = response.statusCode();
+            long elapsed = System.nanoTime() - started;
             if (code >= 200 && code < 300) {
+                metrics.webhookAttempt("delivered", elapsed);
                 markDelivered(id, code);
             } else {
+                metrics.webhookAttempt("http_error", elapsed);
                 markFailure(id, attempts, code, "HTTP " + code, false);
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } catch (Exception e) {
+            metrics.webhookAttempt("exception", System.nanoTime() - started);
             markFailure(id, attempts, null, e.getClass().getSimpleName() + ": " + e.getMessage(), false);
         }
     }
@@ -156,6 +164,7 @@ public class WebhookDispatcher {
         if (permanent || attempts >= maxAttempts) {
             jdbc.update("UPDATE webhook_events SET status = 'DEAD', last_status_code = ?, last_error = ? "
                     + "WHERE id = ?", statusCode, err, id);
+            metrics.webhookDead();
             log.warn("Webhook event {} moved to dead-letter after {} attempts: {}", id, attempts, err);
         } else {
             long delayMs = backoffMillis(attempts);

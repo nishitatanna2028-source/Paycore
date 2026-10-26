@@ -36,3 +36,15 @@ paycore:
     lease-seconds: 60                                       # a claimed event not finished in this time is retried
     batch-size: 20
     poll-interval-ms: 1000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  metrics:
+    tags:
+      application: paycore
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true      # latency buckets, so Prometheus can compute p95/p99

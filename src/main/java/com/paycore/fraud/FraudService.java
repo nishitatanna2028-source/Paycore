@@ -2,6 +2,7 @@ package com.paycore.fraud;
 
 import com.paycore.common.ApiException;
 import com.paycore.domain.RiskFlag;
+import com.paycore.metrics.BusinessMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -33,16 +34,18 @@ public class FraudService {
     }
 
     private final StringRedisTemplate redis;
+    private final BusinessMetrics metrics;
     private final DefaultRedisScript<Long> velocityScript = new DefaultRedisScript<>();
     private final boolean enabled;
     private final int velocityMaxPerMinute;
     private final long reviewAmount;
 
-    public FraudService(StringRedisTemplate redis,
+    public FraudService(StringRedisTemplate redis, BusinessMetrics metrics,
                         @Value("${paycore.fraud.enabled:true}") boolean enabled,
                         @Value("${paycore.fraud.velocity-max-per-minute:60}") int velocityMaxPerMinute,
                         @Value("${paycore.fraud.review-amount:10000000}") long reviewAmount) {
         this.redis = redis;
+        this.metrics = metrics;
         this.enabled = enabled;
         this.velocityMaxPerMinute = velocityMaxPerMinute;
         this.reviewAmount = reviewAmount;
@@ -57,6 +60,7 @@ public class FraudService {
         long recent = recentAttempts(customerId);
         if (recent > velocityMaxPerMinute) {
             log.warn("Fraud: declined payment for customer {} ({} attempts in the last minute)", customerId, recent);
+            metrics.fraudDeclined();
             throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY,
                     "Payment declined: too many payments from this customer in the last minute");
         }

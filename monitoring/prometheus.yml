@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 5s          # fast enough for a live demo dashboard
+
+scrape_configs:
+  - job_name: paycore
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["app:8081"]  # the app's management port (not the public API port)

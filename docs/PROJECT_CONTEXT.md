@@ -81,6 +81,8 @@ src/main/java/com/paycore/PayCoreApplication.java      @SpringBootApplication ma
   domain/{Account,LedgerEntry,Payment}.java   JPA entities (field access, snake_case columns by Spring naming)
   domain/{AccountType,Direction,PaymentStatus,RiskFlag}.java   enums
   fraud/FraudService.java                     velocity + large-amount screening
+  metrics/BusinessMetrics.java                counters/timers facade (section 6.1); after-commit increments
+  metrics/QueueMetrics.java                   gauges refreshed by @Scheduled every 15 s (cached AtomicLongs)
   repo/{AccountRepository,PaymentRepository,LedgerRepository}.java
   security/ApiAuthFilter.java                 OncePerRequestFilter: auth + rate limit
   security/ApiKeyService.java                 issue / authenticate / revoke API keys (JdbcTemplate)
@@ -96,6 +98,11 @@ src/test/java/com/paycore/AbstractIntegrationTest.java   shared Testcontainers +
 src/test/java/com/paycore/PaymentApiTest.java            11 tests
 src/test/java/com/paycore/WebhookDeliveryTest.java       3 tests
 src/test/java/com/paycore/FraudRulesTest.java            3 tests (lowers velocity limit to 5 via @TestPropertySource)
+src/test/java/com/paycore/MetricsTest.java               4 tests (MeterRegistry-based; see pitfalls)
+monitoring/prometheus.yml                     scrape app:8081 /actuator/prometheus every 5 s
+monitoring/grafana/provisioning/{datasources,dashboards}/*.yml   datasource uid `prometheus`, file dashboard provider
+monitoring/grafana/dashboards/paycore.json    12 panels / 19 PromQL queries (all executed against a real Prometheus in the sandbox)
+docs/images/                                  README screenshots (user adds grafana-dashboard.png, then uncomments the README line)
 ```
 
 ---
@@ -105,7 +112,7 @@ src/test/java/com/paycore/FraudRulesTest.java            3 tests (lowers velocit
 - Maven (no wrapper), Java 17, Spring Boot **3.2.5**. Dependencies: web, data-jpa, validation, data-redis, flyway-core,
   postgresql (runtime), springdoc-openapi-starter-webmvc-ui 2.5.0, starter-test (test), `org.testcontainers:postgresql` (test).
 - `pom.xml` pins `<testcontainers.version>1.21.4</testcontainers.version>` (overrides Spring Boot's managed 1.19.x; see section 12). Keep it >= 1.21.4 or move to the 2.x line (artifact/package names change in 2.x).
-- No Lombok, no Spring Security, no actuator/micrometer yet (planned).
+- Also: `spring-boot-starter-actuator`, `io.micrometer:micrometer-registry-prometheus` (step 6). No Lombok, no Spring Security.
 - Docker image build skips test **compilation** (`-Dmaven.test.skip=true`) so a test bug can never break the image.
   Tests run only in CI / `mvn verify`.
 - Jackson `ObjectMapper` is Spring's auto-configured bean (ISO dates). Entities serialize via getters.
@@ -172,11 +179,13 @@ locks both accounts via `AccountRepository.findByIdForUpdate` in sorted order, c
 
 **`AccountService`** `create(String, AccountType)`, `get(UUID)` (404), `deposit(UUID, long)` (rejects SYSTEM; transfers from FUNDING, reason `DEPOSIT`).
 
-**`PaymentService`** (ctor: `PaymentRepository, AccountRepository, LedgerService, WebhookService, FraudService, @Value("${paycore.escrow-shards:1}") int`)
+**`PaymentService`** (ctor: `PaymentRepository, AccountRepository, LedgerService, WebhookService, FraudService, BusinessMetrics, @Value("${paycore.escrow-shards:1}") int`)
 `create(customerId, merchantId, amount)` (validates account types, `fraud.assess`, marks REVIEW, saves, enqueues `payment.created`);
 `getOwned(id, merchantId)`; `authorize|capture|voidPayment|refund(UUID id, UUID merchantId)` (lock payment, `assertOwner` => 404, state move, transfer, enqueue event);
 `approveReview(UUID)` (admin; 409 unless REVIEW; enqueues `payment.review_approved`); `reviewQueue()` (top 100 REVIEW, oldest first).
 Event types: `payment.created|authorized|captured|voided|refunded|review_approved`.
+
+**Constructors changed in step 6 (keep in sync):** `FraudService(StringRedisTemplate, BusinessMetrics, @Value enabled, @Value velocityMax, @Value reviewAmount)`; `ApiAuthFilter(ApiKeyService, RateLimiter, BusinessMetrics, @Value adminKey)`; `WebhookDispatcher(JdbcTemplate, BusinessMetrics, @Value x6)`. Tests never construct these directly (Spring wires them).
 
 **`FraudService`** `Assessment assess(UUID customerId, long amount)`: velocity via `fraud_velocity.lua` (key `fraud:vel:<customerId>`, 60 000 ms window,
 unique member per attempt, fails open on Redis error) => `ApiException(422, "Payment declined: too many payments from this customer in the last minute")` when count > max;
@@ -206,6 +215,26 @@ else backoff `base*2^(n-1)` capped, jitter 0.8..1.2; `attempts>=max` or deactiva
 
 ---
 
+### 6.1 Metric catalog (Prometheus names; every series carries `application="paycore"`)
+
+| Metric | Type | Tags | Emitted by |
+|---|---|---|---|
+| `paycore_payments_transitions_total` | counter | `to` = created, authorized, captured, voided, refunded, review_approved | `PaymentService` via `BusinessMetrics.transition` (**after commit**) |
+| `paycore_fraud_decisions_total` | counter | `outcome` = declined (immediate), review (after commit) | `FraudService`, `PaymentService.create` |
+| `paycore_auth_failures_total` | counter | `caller` = merchant, admin | `ApiAuthFilter` |
+| `paycore_ratelimit_rejected_total` | counter | `caller` = merchant, admin | `ApiAuthFilter` |
+| `paycore_webhooks_delivery_seconds_{count,sum,max}` | timer | `outcome` = delivered, http_error, exception | `WebhookDispatcher.deliver` |
+| `paycore_webhooks_dead_total` | counter | none | `WebhookDispatcher.markFailure` (DEAD branch) |
+| `paycore_webhooks_events` | gauge | `status` = pending, dead (refreshed every 15 s) | `QueueMetrics` |
+| `paycore_payments_review_queue` | gauge | none | `QueueMetrics` |
+| `http_server_requests_seconds_{count,sum,bucket}` | auto | `uri` (templated), `status`, `method` | Spring MVC (`percentiles-histogram` enabled) |
+| `hikaricp_connections_{active,pending,max,idle,min}`, `hikaricp_connections_acquire_seconds_{sum,count}` | auto | `pool` | HikariCP binder |
+| `jvm_*`, `process_cpu_usage`, `system_cpu_usage` | auto | | Micrometer binders |
+
+All `paycore_*` series are pre-registered at startup (value 0). Add new metrics to `BusinessMetrics`, never directly in business classes.
+
+---
+
 ## 7. HTTP API
 
 ### 7.1 Authentication and routing (`ApiAuthFilter`, in this order)
@@ -215,6 +244,7 @@ else backoff `base*2^(n-1)` capped, jitter 0.8..1.2; `attempts>=max` or deactiva
 3. **Everything else => admin**: `X-Admin-Key` compared constant-time with `paycore.admin-key`; identity `admin`.
 4. Rate limit: sets `X-RateLimit-Limit` (+ `X-RateLimit-Remaining` if known); denied => 429 + `Retry-After`.
 5. Sets request attribute `ApiAuthFilter.ATTR` = `AuthContext`; controllers read it via `HttpServletRequest`.
+6. **Actuator:** compose sets `MANAGEMENT_SERVER_PORT=8081`, so `/actuator/**` is served by a separate management server that this filter does NOT cover (Boot does not apply main-context servlet filters to the management child context). With the variable unset (tests, CI), `/actuator/**` is on the API port and falls under rule 3 (admin key).
 
 ### 7.2 Endpoints
 
@@ -259,6 +289,9 @@ Payment JSON fields: `id, customerId, merchantId, amount, status, createdAt, upd
 | `paycore.webhooks.max-delay-seconds` / `lease-seconds` / `batch-size` / `poll-interval-ms` | none | `3600` / `60` / `20` / `1000` | WebhookDispatcher |
 | `spring.datasource.*` | `DB_URL`, `DB_USER`, `DB_PASSWORD` | local Postgres `paycore/paycore` | Hikari max pool 30 |
 | `spring.data.redis.host` | `REDIS_HOST` | `localhost` | timeouts 500 ms |
+| `management.server.port` | `MANAGEMENT_SERVER_PORT` | unset in yml; compose `8081` | separate metrics/health port |
+| `management.endpoints.web.exposure.include` | none | `health,prometheus` | actuator |
+| `management.metrics.tags.application` / `...distribution.percentiles-histogram.http.server.requests` | none | `paycore` / `true` | Micrometer |
 
 Note: `@Value` defaults in code (e.g. `escrow-shards:1`) are fallbacks only; the yml value wins.
 
@@ -271,6 +304,10 @@ Services: `db` (postgres:15-alpine, user/db/password `paycore`, healthcheck), `r
 `extra_hosts host.docker.internal:host-gateway`), `k6` (grafana/k6:0.52.0, profile `loadtest`, `user: "0"`, mounts `./loadtest:/loadtest`, `BASE_URL=http://app:8080`).
 The `app` env has a **commented** block of three lines (`RATE_LIMIT_CAPACITY`, `RATE_LIMIT_REFILL` = 1000000, `FRAUD_ENABLED="false"`) that the user
 uncomments ONLY for load tests, then re-comments.
+
+### 8.4 Monitoring stack
+`app` publishes `8081` (metrics) in addition to `8080`. Services `prometheus` (prom/prometheus:v2.54.1, :9090) and `grafana` (grafana/grafana:11.2.0, :3000, anonymous Viewer,
+admin password `admin`, home dashboard `paycore.json`) are under compose profile `monitoring`: `docker compose --profile monitoring up -d --build`. Never publish 8081 in production.
 
 ---
 
@@ -294,6 +331,7 @@ uncomments ONLY for load tests, then re-comments.
 | `scripts/fraud_test.py` | 10 | fraud ON, default thresholds (or matching `FRAUD_*` env) | velocity check makes VELOCITY_MAX+5 sequential creates for one fresh customer (needs merchant rate burst >= 65) |
 | Java `PaymentApiTest` | 11 | Docker | base class sets rate limit 100000, velocity 1000, allow-private, webhook base 1 s / max 5 |
 | Java `WebhookDeliveryTest` | 3 | Docker | in-process `com.sun.net.httpserver.HttpServer` receiver; independent HMAC verification |
+| Java `MetricsTest` | 4 | Docker | uses `MeterRegistry` (no HTTP scrape); deltas of counters, so order-independent |
 | Java `FraudRulesTest` | 3 | Docker | `@TestPropertySource` velocity 5 (higher precedence than `@SpringBootTest(properties)`) |
 | `loadtest/payment_flow.js` | n/a | rate limit + fraud **OFF** (commented compose lines) | each VU = own customer + own merchant; flags >5% errors |
 
@@ -308,8 +346,9 @@ from a latch. Test classes end in `Test` (Surefire default). Datasets are isolat
 | Component | State |
 |---|---|
 | Steps 1 to 4 (ledger, auth, rate limit, webhooks, sharding, k6) | **Run and passing on the user's machine** (all Python scripts green at those steps; k6 results recorded) |
-| Step 5 (fraud rules, Java integration tests, CI) | **Delivered, not yet run by the user.** Verified here: Java syntax (`javac`), tests type-checked against stubs, both Lua scripts against a fake Redis, YAML/XML/Python syntax |
-| First CI run | **Failed**: every Java test died with `ExceptionInInitializerError` because Testcontainers 1.19 could not talk to Docker Engine 29 on the GitHub runner ("client version 1.32 is too old"). Fixed by pinning Testcontainers 1.21.4 (`paycore-step5-fix.zip`). Re-run result pending; any further CI failure needs the FIRST `Caused by:` / `[ERROR]` line, not the tail of the log |
+| Step 5 (fraud rules, Java integration tests, CI) | **CI green**: all 17 Java integration tests passed on the GitHub runner. `scripts/fraud_test.py` local run not yet reported by the user |
+| Step 6 (metrics, Prometheus, Grafana) | **Delivered, not yet run by the user.** Verified here: Java syntax, new classes + `MetricsTest` type-checked against stubs, `promtool check config`, all 19 dashboard PromQL queries executed on a real Prometheus against a fake exporter, YAML/JSON validity. NOT verified: Spring wiring, actuator on port 8081, Grafana rendering |
+| CI history | Run #1 **failed**: every Java test died with `ExceptionInInitializerError` because Testcontainers 1.19 could not talk to Docker Engine 29 on the GitHub runner ("client version 1.32 is too old"). Fixed by pinning Testcontainers 1.21.4 (`paycore-step5-fix.zip`); run #2 passed (CI also bumped to checkout@v5 / setup-java@v5 in step 6). Any new CI failure needs the FIRST `Caused by:` / `[ERROR]` line, not the tail of the log |
 
 ### Measured results (real, from the user's machine)
 50 VUs, 60 s, rate limit and fraud off, 0% errors:
@@ -333,6 +372,10 @@ Resume bullet (measured): "Profiled the payment path with k6 (50 concurrent user
 - **Flyway**: never edit applied migrations; V6 is next.
 - **Docker image build** must not compile tests (`-Dmaven.test.skip=true`).
 - **Testcontainers vs Docker 29 (hit in CI)**: GitHub's ubuntu runners ship Docker Engine 29 (minimum API 1.44). Testcontainers < 1.21.4 uses API 1.32 and fails with `Could not find a valid Docker environment ... client version 1.32 is too old`, surfacing in JUnit as `ExceptionInInitializerError` / `NoClassDefFoundError: Could not initialize class ...Test`. Fix = `testcontainers.version` 1.21.4 in the pom. When CI shows that error pattern in a test base class's static initializer, suspect container startup first.
+- **Metrics in tests**: `@SpringBootTest` disables metric *export* (no Prometheus endpoint, `MeterRegistry` is in-memory), so `MetricsTest` asserts through the registry; the scrape endpoint is verified by hand on the running stack. Don't write HTTP-scrape tests without `@AutoConfigureObservability`.
+- **Management port**: keep `MANAGEMENT_SERVER_PORT` out of `application.yml`; if it were set in tests, each cached Spring context would try to bind the same port.
+- **After-commit counters**: `BusinessMetrics.transition` registers a `TransactionSynchronization`; calling it outside a transaction increments immediately. Don't increment payment counters directly.
+- **QueueMetrics** runs three `COUNT(*)` queries every 15 s; `status='DEAD'` has no partial index (fine at demo scale; add a V6 index if the table grows).
 - **Testcontainers**: use the singleton-container pattern; do not use `@Container` in the abstract base (contexts are cached across classes).
 - **`@LocalServerPort`** package differs across Boot versions; the tests use `@Value("${local.server.port}")`.
 - **TestRestTemplate/HttpURLConnection** mishandles 401 on POST; tests use the JDK `HttpClient` instead.
@@ -358,21 +401,16 @@ Resume bullet (measured): "Profiled the payment path with k6 (50 concurrent user
 
 Idempotency keys never expire; webhook ordering not guaranteed; API-key lookup hits the DB on every request; webhook secrets stored plaintext (needed to sign);
 merchant/customer rows can still be hot; escrow shards capped at 16 by V4; held (REVIEW) payments can only be approved, not rejected/cancelled; only two fraud rules;
-no pagination on ledger/events beyond limits; no metrics; no deployment; first CI run pending.
+no pagination on ledger/events beyond limits; metrics port is unauthenticated by design (private network only); no deployment.
 
 ---
 
 ## 15. Roadmap with technical notes for the remaining steps
 
-**6. Metrics (Micrometer, Prometheus, Grafana).** Add `spring-boot-starter-actuator` + `micrometer-registry-prometheus`; expose `/actuator/prometheus` and `/actuator/health`.
-**`ApiAuthFilter` treats unknown paths as admin-only**, so either add `/actuator/health` and `/actuator/prometheus` to `isPublic` (acceptable only on an internal network)
-or configure Prometheus to send `X-Admin-Key`. Suggested custom meters: payments by status/transition, fraud declines/reviews, rate-limit rejections, webhook deliveries by outcome,
-DEAD queue size (gauge via a count query), request latency histograms (percentiles), Hikari pool metrics (already auto-bound). Compose: add `prometheus` (scrape `app:8080`)
-and `grafana` services with a provisioned datasource + a dashboard JSON; keep them under a compose profile so the default stack stays light. Use metrics to identify the next
-bottleneck (Hikari wait time, DB commit latency) and optionally run a second measured optimisation (e.g. pool size, API-key cache) with before/after k6 numbers.
+**6. Metrics: DONE (delivered in `paycore-step6.zip`).** Remaining follow-up: with the dashboard open, run the k6 load test and identify the next bottleneck from the pool/CPU/latency panels (Hikari `pending` vs `active`, CPU saturation, per-endpoint p95); optionally implement ONE measured optimisation (e.g. Hikari pool size, API-key cache) with before/after k6 numbers (remember the 3 commented compose lines for load tests). The user should add a dashboard screenshot at `docs/images/grafana-dashboard.png` and uncomment the README line.
 
 **7. Deployment.** Fly.io or Render: set `ADMIN_KEY` to a real secret, `WEBHOOK_ALLOW_PRIVATE=false`, managed Postgres (`DB_URL/DB_USER/DB_PASSWORD`) and Redis (`REDIS_HOST`;
-add `spring.data.redis.password/ssl` properties if the provider requires them; the app fails open if Redis is down), expose 8080, keep Swagger public for the demo,
+add `spring.data.redis.password/ssl` properties if the provider requires them; the app fails open if Redis is down), expose ONLY 8080 (never publish the management port; on single-port platforms leave `MANAGEMENT_SERVER_PORT` unset so `/actuator/**` requires the admin key, or skip Prometheus there), keep Swagger public for the demo,
 turn off the dev webhook overrides. Add a "Live demo" link to the README; consider a seeded demo merchant.
 
 **8. Polish.** Frontend dashboard (low priority, a single static page served by Spring or separate), architecture diagram refresh, final resume bullets (measured numbers only).
@@ -389,3 +427,4 @@ turn off the dev webhook overrides. Add a "Live demo" link to the README; consid
 | `paycore-step4.zip`, `-fix`, `-results` | k6 load test, escrow sharding V4, README rewrite, rate-limit/fraud guard, measured results, shards default 16 |
 | `paycore-step5.zip` | Fraud rules V5 + `fraud_test.py`, Testcontainers tests, GitHub Actions CI, Dockerfile test-skip, README + this file rewritten |
 | `paycore-step5-fix.zip` | `pom.xml` pins Testcontainers 1.21.4 (fixes CI vs Docker Engine 29); this file updated |
+| `paycore-step6.zip` | Metrics: actuator + Micrometer/Prometheus, `BusinessMetrics`/`QueueMetrics`, instrumented PaymentService/FraudService/ApiAuthFilter/WebhookDispatcher, `MetricsTest`, monitoring stack (compose profile), Grafana dashboard, CI actions v5, README + this file |

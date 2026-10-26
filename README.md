@@ -32,6 +32,7 @@ able to prove that the books balance.
 - [Design Decisions](#design-decisions)
 - [Testing and CI](#testing-and-ci)
 - [Performance](#performance)
+- [Observability](#observability)
 - [Configuration Reference](#configuration-reference)
 - [Project Structure](#project-structure)
 - [Limitations & Roadmap](#limitations--roadmap)
@@ -51,6 +52,7 @@ able to prove that the books balance.
 | **Fraud screening** | Sliding-window velocity rule (declines) and large-amount rule (holds for manual review), both enforced server-side. |
 | **Webhooks** | Transactional outbox, HMAC-signed requests, exponential backoff with jitter, dead-letter queue and replay. |
 | **Scalability work** | Escrow sharding removed a single-row lock bottleneck: **4.4× throughput** (673 → 2,991 req/s) and **−80% p95 latency** in k6 load tests. |
+| **Observability** | Prometheus metrics and a ready-made Grafana dashboard: throughput, latency percentiles, payment flow, fraud decisions, webhook queues, DB pool and CPU. |
 | **Automated tests + CI** | Integration tests run the real app against real PostgreSQL and Redis containers (Testcontainers) on every push. |
 
 ---
@@ -73,6 +75,8 @@ flowchart LR
     Services -->|"ONE transaction:<br/>ledger + state + outbox event"| PG
     Dispatcher <-->|"claim and update events"| PG
     Dispatcher -->|"signed POST, retried"| Merchant([Merchant webhook endpoint])
+    Prometheus["Prometheus"] -.->|"scrapes /actuator/prometheus"| PayCore
+    Grafana["Grafana dashboard"] --> Prometheus
 ```
 
 Every state change writes the ledger entries, the new payment status **and** the webhook event in a single database
@@ -94,6 +98,9 @@ docker compose up --build
 | Swagger UI | [localhost:8080/swagger-ui.html](http://localhost:8080/swagger-ui.html) (use the **Authorize** button) |
 | PostgreSQL | `localhost:5432` |
 | Redis | `localhost:6379` |
+
+Optional monitoring (Prometheus + Grafana): `docker compose --profile monitoring up -d --build`, then open
+[localhost:3000](http://localhost:3000). See [Observability](#observability).
 
 ---
 
@@ -313,6 +320,11 @@ Each transfer is one PostgreSQL transaction, so a crash cannot leave a debit wit
 Screening happens inside the payment-creation transaction. A decline creates nothing; a review hold is stored on the
 payment itself and enforced in `authorize`, so it cannot be bypassed by a client.
 
+### 11. Metrics that cannot lie
+Business counters are incremented in a transaction *after-commit* hook, so a request that rolls back (insufficient funds, a
+fraud decline, an idempotent replay) is never counted as done. Operational endpoints are served on a separate management
+port that is not part of the public API.
+
 ---
 
 ## Testing and CI
@@ -327,6 +339,7 @@ GitHub Actions (`.github/workflows/ci.yml`).
 |---|---|
 | `PaymentApiTest` | 20 parallel requests with one idempotency key create one payment; same key with a different body is rejected; 30 parallel authorizations on a ₹1.00 balance succeed exactly 10 times and never overdraw; 10 parallel captures move money once; full lifecycle and illegal transitions; void releases funds; missing/fake/revoked keys are rejected; merchants cannot see or touch each other's payments; idempotency keys are scoped per merchant; the books balance afterwards |
 | `WebhookDeliveryTest` | A receiver that fails twice still gets the event; every attempt carries a valid HMAC signature; the event ends `DELIVERED`; an unreachable endpoint ends `DEAD` after 5 attempts and can be replayed; invalid URLs are rejected |
+| `MetricsTest` | State changes are counted exactly once, rejected and replayed requests are not counted, auth failures are counted, queue gauges are registered |
 | `FraudRulesTest` | The 6th payment in a minute is declined while other customers are unaffected; a large payment is held for review, blocked from authorizing, invisible to merchant approval, approved by an admin, then authorizes |
 
 Running them locally needs JDK 17, Maven and Docker running: `mvn verify`. Without a local JDK, push to GitHub and read
@@ -412,7 +425,63 @@ Raw results: [`loadtest/results/baseline.json`](loadtest/results/baseline.json) 
   and an 80% drop in tail latency.
 - The gain is 4.4× rather than 16× because the bottleneck moved to resources that are still shared (CPU on one machine,
   PostgreSQL commits, the 30-connection pool) and because hashing 50 concurrent payments over 16 shards still produces
-  some collisions. Finding the next bottleneck needs metrics (see roadmap).
+  some collisions. The [Observability](#observability) dashboard shows which shared resource saturates next (CPU, database pool wait, per-endpoint latency).
+
+---
+
+## Observability
+
+PayCore exposes Prometheus metrics, and the repo ships a ready-made Grafana dashboard. The monitoring stack is optional and
+starts only when you ask for it:
+
+```bash
+docker compose --profile monitoring up -d --build
+```
+
+| What | Address |
+|---|---|
+| Grafana dashboard (opens straight to **PayCore**; log in as `admin` / `admin` to edit) | [localhost:3000](http://localhost:3000) |
+| Prometheus (check **Status → Targets** shows `paycore` as UP) | [localhost:9090](http://localhost:9090) |
+| Raw metrics | [localhost:8081/actuator/prometheus](http://localhost:8081/actuator/prometheus) |
+
+Generate traffic (any test script, or the k6 load test) and watch the dashboard update every 5 seconds.
+
+<!-- Add a screenshot taken during a load test, then uncomment:
+![Grafana dashboard](docs/images/grafana-dashboard.png)
+-->
+
+### What the dashboard shows
+
+| Panel | Source | Why it matters |
+|---|---|---|
+| Requests per second and p95 latency, per endpoint | `http_server_requests_seconds_*` | Which endpoints are slow, and when |
+| 4xx / 5xx per second | `http_server_requests_seconds_count` | Client mistakes versus real failures |
+| Payment state changes per second | `paycore_payments_transitions_total{to}` | Business throughput: created, authorized, captured, voided, refunded |
+| Fraud decisions per second | `paycore_fraud_decisions_total{outcome}` | Declines and manual-review holds |
+| Rejected requests per second | `paycore_ratelimit_rejected_total`, `paycore_auth_failures_total` | Rate limiting and failed authentication |
+| Webhook delivery attempts per second | `paycore_webhooks_delivery_seconds_count{outcome}` | Delivered, HTTP errors, connection failures |
+| Queues | `paycore_webhooks_events{status}`, `paycore_payments_review_queue` | Webhook backlog, dead-letter queue, payments awaiting review |
+| Database connection pool, and wait to get a connection | `hikaricp_connections_*` | Whether the pool is the bottleneck |
+| CPU and JVM heap | `process_cpu_usage`, `system_cpu_usage`, `jvm_memory_used_bytes` | Whether the machine is the bottleneck |
+
+### Design notes
+
+- **Counters only count real work.** Payment state changes are counted *after the database transaction commits*, so
+  idempotent replays, rejected requests and rolled-back transactions never inflate a number.
+- **Metrics live on their own port** (`8081`), outside the public API and outside the authentication filter. In
+  production that port stays on the private network and is never published.
+- **Scrapes never touch the database.** Queue sizes are refreshed by a background job every 15 seconds and the gauges
+  read the cached values.
+- **Latency percentiles** use histogram buckets, so p95 and p99 are computed correctly across instances.
+- **Every series exists from startup** (at 0), so dashboards never show "no data" before the first event.
+
+### Finding the next bottleneck
+
+Run the [k6 load test](#performance) with the dashboard open and compare the panels:
+
+- *Connections waiting* climbing while *in use* sits at the pool size: the database connection pool is too small.
+- High *system CPU* with a flat pool: the machine is saturated.
+- Latency rising on one endpoint only: the problem is in that code path.
 
 ---
 
@@ -427,6 +496,7 @@ All settings are environment variables with safe defaults (see `src/main/resourc
 | `ADMIN_KEY` | `dev-admin-key` | Admin API key. **Change it outside local development.** |
 | `RATE_LIMIT_CAPACITY` / `RATE_LIMIT_REFILL` | `100` / `50` | Token bucket burst size and refill per second, per API key |
 | `ESCROW_SHARDS` | `16` | Escrow accounts to spread held funds over (1 to 16) |
+| `MANAGEMENT_SERVER_PORT` | unset (compose: `8081`) | Serve metrics/health on a separate port. If unset, `/actuator/**` is on the API port and needs the admin key. |
 | `FRAUD_ENABLED` | `true` | Turn fraud screening on or off |
 | `FRAUD_VELOCITY_MAX` | `60` | Payment attempts per customer per minute before declining |
 | `FRAUD_REVIEW_AMOUNT` | `10000000` | Minor units; at or above this a payment is held for review |
@@ -445,6 +515,7 @@ paycore/
 ├── pom.xml
 ├── docs/PROJECT_CONTEXT.md     # detailed technical notes / handoff
 ├── loadtest/                   # k6 script, comparison tool, saved results
+├── monitoring/                 # Prometheus config, Grafana datasource and dashboard
 ├── scripts/                    # concurrency_test.py, webhook_test.py, fraud_test.py
 └── src
     ├── main
@@ -457,6 +528,7 @@ paycore/
     │       ├── config/         # OpenAPI and scheduling config
     │       ├── domain/         # Account, Payment, LedgerEntry, PaymentStatus, RiskFlag
     │       ├── fraud/          # velocity + large-amount screening
+    │       ├── metrics/        # business metrics and queue gauges
     │       ├── repo/           # Spring Data repositories (with row-lock queries)
     │       ├── security/       # auth filter, API keys, Redis rate limiter
     │       ├── service/        # Ledger, Payment, Account, Idempotency, Reconciliation
@@ -476,6 +548,7 @@ paycore/
 | Webhooks | At-least-once and unordered; one dispatcher polls per instance (safe to run several) |
 | API key lookup | One database query per request; a short-lived cache would help |
 | Webhook secrets | Stored in plaintext because the server must sign with them |
+| Metrics port | Unauthenticated by design, on its own port; keep it private and never publish it |
 | Fraud rules | Two simple rules; a held payment can only be approved, not rejected |
 
 **Roadmap**
@@ -486,7 +559,7 @@ paycore/
 - [x] k6 load test and escrow sharding
 - [x] Fraud rules with a manual review workflow
 - [x] Java integration tests (Testcontainers) and CI
-- [ ] Metrics and dashboards (Micrometer, Prometheus, Grafana)
+- [x] Metrics and dashboards (Micrometer, Prometheus, Grafana)
 - [ ] Public deployment
 
 ---

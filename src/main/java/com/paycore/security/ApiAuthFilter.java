@@ -1,5 +1,6 @@
 package com.paycore.security;
 
+import com.paycore.metrics.BusinessMetrics;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -26,11 +27,13 @@ public class ApiAuthFilter extends OncePerRequestFilter {
     private final ApiKeyService apiKeys;
     private final RateLimiter rateLimiter;
     private final byte[] adminKey;
+    private final BusinessMetrics metrics;
 
-    public ApiAuthFilter(ApiKeyService apiKeys, RateLimiter rateLimiter,
+    public ApiAuthFilter(ApiKeyService apiKeys, RateLimiter rateLimiter, BusinessMetrics metrics,
                          @Value("${paycore.admin-key}") String adminKey) {
         this.apiKeys = apiKeys;
         this.rateLimiter = rateLimiter;
+        this.metrics = metrics;
         this.adminKey = adminKey.getBytes(StandardCharsets.UTF_8);
     }
 
@@ -50,6 +53,7 @@ public class ApiAuthFilter extends OncePerRequestFilter {
             String rawKey = bearerToken(req);
             Optional<ApiKeyService.KeyInfo> info = rawKey == null ? Optional.empty() : apiKeys.authenticate(rawKey);
             if (info.isEmpty()) {
+                metrics.authFailure("merchant");
                 reject(res, 401, "Missing or invalid API key. Send 'Authorization: Bearer <key>'.");
                 return;
             }
@@ -59,6 +63,7 @@ public class ApiAuthFilter extends OncePerRequestFilter {
             String provided = req.getHeader("X-Admin-Key");
             // constant-time comparison so response timing can't leak the key
             if (provided == null || !MessageDigest.isEqual(adminKey, provided.getBytes(StandardCharsets.UTF_8))) {
+                metrics.authFailure("admin");
                 reject(res, 401, "Missing or invalid admin key. Send 'X-Admin-Key: <key>'.");
                 return;
             }
@@ -73,6 +78,7 @@ public class ApiAuthFilter extends OncePerRequestFilter {
         }
         if (!decision.allowed()) {
             res.setHeader("Retry-After", String.valueOf(decision.retryAfterSeconds()));
+            metrics.rateLimited(auth.merchantId() == null ? "admin" : "merchant");
             reject(res, 429, "Rate limit exceeded. Retry after " + decision.retryAfterSeconds() + "s.");
             return;
         }
